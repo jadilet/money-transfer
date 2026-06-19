@@ -1,0 +1,35 @@
+# Build output
+target/
+build/
+!.mvn/wrapper/maven-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+
+# Claude Code local state — do NOT share
+.claude/
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+
+# Local env / secrets — never commit real credentials
+.env
+*.env
+application-local.properties
+application-secret.properties
+*-secret.properties
+*.pem
+*.key
+*.p12
+*.jks
+*.keystore
+
+# Load-test generated data
+load/accounts.json
