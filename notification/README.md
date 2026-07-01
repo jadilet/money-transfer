@@ -168,7 +168,7 @@ flowchart TB
 
 ### 3.4 Recommendation
 
-For a bank with a strict sub-500 ms transactional target, data-residency constraints, and high steady volume, **Approach A** is the stronger default: predictable latency without cold-start mitigation, portability for residency, and cost efficiency at consistent high load. **Approach B** is attractive where operational headcount is scarce, load is spiky, or time-to-market dominates — and a **hybrid** is viable: managed services for the bursty marketing path, self-managed warm workers for the latency-critical transactional path. The final choice should be validated against the cost model and a latency proof-of-concept (Section 4).
+For a bank with a strict sub-500 ms transactional target, data-residency constraints, and high steady volume, [(**Approach A**)](notification-architecture-overview.md) is the stronger default: predictable latency without cold-start mitigation, portability for residency, and cost efficiency at consistent high load. **Approach B** is attractive where operational headcount is scarce, load is spiky, or time-to-market dominates.
 
 ---
 
