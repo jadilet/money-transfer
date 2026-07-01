@@ -99,6 +99,7 @@ Each component is an assignable unit of work with a clear responsibility and int
 | Connection gateway | Hold live WebSocket connections to web clients; push notifications to connected users in real time | Accepts client WebSockets; consumes delivery tasks for connected users |
 | Datastore | Persist preferences, templates, tokens, audit log | Backing store for above services |
 
+**Phased consolidation (initial release).** The table above describes the target architecture, where each component is independently deployable. For the initial release, three of these may start as modules *within the worker service* rather than as separate services: the **preference service**, the **template service**, and the **delivery layer** (provider adapters, retry, DLQ, status recording). This reduces the number of deployables to stand up first and removes network hops from the transactional latency path. The consolidation is a deployment choice, not an architectural one: each merged concern stays behind a clean internal interface shaped like its Section 6 contract, so it can be extracted into a standalone service later without a rewrite. Two constraints apply when delivery runs inside the worker — provider calls must be dispatched off the Kafka consume loop (so a slow provider call cannot stall a partition), and the preference-management API must remain reachable by the mobile and web apps.
 ---
 
 ## 4. Channels
@@ -164,12 +165,103 @@ The app holds its own persistent connection (e.g. a WebSocket or long-lived sock
 
 ## 6. Contracts and Boundaries
 
-The interfaces below are the stable seams between teams. Internals may change freely as long as these hold.
+The interfaces below are the stable seams between teams. They are defined here so that each component can be built, tested, and deployed independently against a shared agreement. Internals may change freely as long as these contracts hold. Changes to a contract follow the evolution rules in Section 6.6 — never a silent breaking change.
 
-- **Producer → notification system.** Core modules emit events conforming to a single canonical event schema (owned and versioned centrally, enforced by the schema registry). Producers depend only on this contract, never on notification internals.
-- **Category drives routing and policy.** Every event declares a category (transactional vs marketing). Category determines the stream, the worker pool, and the content/PII policy applied at delivery.
+The guiding seams:
+
+- **Producer → notification system.** Core modules emit events conforming to the canonical event schema (6.2), owned and versioned centrally, enforced by the schema registry. Producers depend only on this contract, never on notification internals.
+- **Category drives routing and policy.** Every event declares a category (transactional vs marketing). Category determines the topic, the worker pool, and the content/PII policy applied at delivery.
 - **Delivery layer → providers.** Each channel is a provider adapter behind a common interface; the rest of the system is provider-agnostic.
 - **Idempotency key.** Carried end to end on every event and delivery task; the mechanism by which duplicates are collapsed and retries stay safe.
+
+### 6.1 Kafka Topics
+
+Producers and consumers share one definition of every topic. Partition count is the ceiling on consumer parallelism and is sized against the peak-rate model (Section 8). All event topics are keyed by `user_id` so per-user ordering is preserved and load spreads evenly.
+
+| Topic | Purpose | Partition key | Notes |
+|---|---|---|---|
+| `notifications.transactional` | Transactional events (OTP, fraud, payment) | `user_id` | High partition count; consumed by the reserved warm worker pool |
+| `notifications.marketing` | Marketing / informational events | `user_id` | Consumed by the throttled worker pool |
+| `notifications.dlq` | Dead-letter for events/tasks that exhaust retries | `user_id` | Monitored; supports replay |
+
+Per-topic configuration (partition count, replication factor, retention) is owned by the event-bus team and agreed with producer and consumer teams before launch. Replication factor is set for durability (no data loss on broker failure); retention is set long enough to allow replay within the operational window.
+
+### 6.2 Event Payload Schema
+
+The single canonical contract between core banking producers and the notification system. Registered with the schema registry as Avro or Protobuf so breaking changes are mechanically rejected. Every event conforms to this shape.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `schema_version` | string | yes | Contract version, e.g. `1.0`, for compatibility handling |
+| `event_id` | UUID | yes | Globally unique ID for this event |
+| `idempotency_key` | string | yes | Stable key for the originating business action; used to deduplicate |
+| `user_id` | UUID | yes | Recipient; also the partition key |
+| `category` | enum | yes | `transactional` or `marketing`; determines topic and policy |
+| `type` | string | yes | Specific event type, e.g. `money_received`, `otp`, `fraud_alert`, `statement_ready`, `campaign` |
+| `template_id` | string | yes | Identifier of the template used to render content |
+| `data` | map<string,string> | yes | Fields the template needs; excludes raw PII for sensitive types |
+| `locale` | string | no | Preferred language/locale; falls back to user preference if absent |
+| `priority` | enum | no | `high` or `normal`; defaults from `category` if absent |
+| `created_at` | timestamp | yes | Event creation time (UTC, ISO-8601 / epoch-millis) |
+| `correlation_id` | UUID | yes | Trace ID propagated end to end |
+
+**Rules:** for sensitive types (`otp`, `fraud_alert`, money/transaction types) the `data` map carries only what is needed to render generic gateway text and to let the app fetch detail after authentication — never full account numbers, balances, or counterparty detail that would transit a public gateway.
+
+### 6.3 Endpoint Contracts (synchronous services)
+
+The worker calls these services during processing. Each contract specifies request, response, error behavior, and a latency budget — the budget matters because these calls sit inside the worker's sub-500 ms transactional path. Full request/response schemas are maintained as OpenAPI specs owned by each service team; the summary below is the agreed shape.
+
+| Service | Operation | Request → Response | Error behavior | Latency budget |
+|---|---|---|---|---|
+| Preference service | Resolve delivery decision | `{user_id, category}` → `{channels_enabled[], quiet_hours}` | Unknown user → empty set (fail closed for marketing; security types bypass) | ≤ 50 ms p99 |
+| Template service | Render content | `{template_id, locale, data}` → `{rendered_per_channel}` | Missing template → error; high-priority may use last-known-good | ≤ 50 ms p99 |
+| Device registry | Resolve targets | `{user_id}` → `{tokens[]: {channel, token, status}}` | No valid token → empty set; caller falls back to other channels | ≤ 30 ms p99 |
+| Device registry | Register / prune token | `{user_id, channel, token, status}` → `{ack}` | Invalid on provider rejection → prune | ≤ 50 ms p99 |
+| Preference service | Read / update preferences | `{user_id, channel, category, enabled, quiet_hours}` → `{ack}` | Reject disabling a non-suppressible security category | ≤ 100 ms p99 |
+
+### 6.4 Delivery-Task Contract
+
+The worker emits one delivery task per enabled channel. When delivery is a separate service this is a cross-service message; when delivery runs inside the worker (see the phased-consolidation note in Section 3) it is the same shape as an internal interface, so the boundary is preserved either way.
+
+| Field | Type | Description |
+|---|---|---|
+| `task_id` | UUID | Unique per task |
+| `idempotency_key` | string | Carried from the originating event; deduplicates at the provider |
+| `user_id` | UUID | Recipient |
+| `channel` | enum | `push` `in_app_web` `email` `sms` |
+| `target` | string | Token, subscription, address, or connection reference |
+| `category` | enum | Drives the content/PII policy applied before dispatch |
+| `payload` | object | Rendered content (already PII-stripped for sensitive categories) |
+| `correlation_id` | UUID | Propagated for tracing and audit |
+
+### 6.5 Connection Gateway Contract (WebSocket)
+
+The connection gateway has two contracts: an inbound one for receiving notifications to deliver, and a client-facing one for the web app's live connection.
+
+**Inbound — delivery layer / worker → gateway.** A notification destined for a connected web user is handed to the gateway using the delivery-task shape (6.4) with `channel: in_app_web`. The gateway looks up the user's live connection and pushes the payload down it. If the user has no active connection, the gateway reports the task as undeliverable-live; the notification remains in the persisted in-app feed for retrieval on next connect (see note below).
+
+**Client-facing — web app ↔ gateway.** The contract the browser depends on:
+
+| Aspect | Contract |
+|---|---|
+| Connect | Client opens an authenticated WebSocket (bearer token / session) to the gateway; gateway validates and registers the `user_id → connection` mapping |
+| Message (server → client) | `{notification_id, type, title, body, category, created_at}` pushed over the socket |
+| Acknowledgement | Client acks receipt by `notification_id` so the gateway can mark live-delivered |
+| Heartbeat | Periodic ping/pong to detect dead connections and prune the mapping |
+| Disconnect | On close, gateway removes the mapping; missed notifications are read from the in-app feed on reconnect |
+
+**Persistence boundary.** Because a WebSocket only exists while the tab is open and can drop unexpectedly, every web notification is also written to the persisted in-app feed (in the datastore). The live push is a best-effort accelerator; the feed is the durable source of truth the client reconciles against on connect or reload. This guarantees a dropped socket never means a lost notification.
+
+**Scaling note (not a contract, but a boundary constraint).** The gateway is stateful and scales by concurrent open connections, unlike the stateless worker. If it runs as more than one node, delivering to a socket held by another node requires a shared backplane (pub/sub or a Kafka topic keyed by user/node). A single-node deployment can omit the backplane initially.
+
+### 6.6 Contract Evolution Rules
+
+Contracts are stable seams, but they must be able to change without breaking teams.
+
+- **Backward compatibility.** New fields are optional with defaults; existing fields are never removed or retyped in place. The schema registry enforces this for the event schema.
+- **Versioning.** A breaking change requires a new `schema_version` (events) or an API version (endpoints), with a migration window during which both are accepted.
+- **Review.** Contract changes are reviewed with all affected teams before merge, not applied unilaterally.
+- **Contract testing.** Each component ships tests asserting it honors the shared contract, so a breaking change is caught in CI rather than at integration.
 
 ---
 
