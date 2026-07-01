@@ -1,4 +1,4 @@
-# Notification System — Architecture Overview
+# Approaach A — Architecture Overview
 
 
 Multi-channel notification platform for the bank's mobile and web applications, serving 1.54M active users across Android, iOS, and web.
